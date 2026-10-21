@@ -1,0 +1,82 @@
+services:
+  # ====================================================================
+  # Core Redis Broker & Persistence Engine
+  # ====================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: goqueue-redis
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+    restart: unless-stopped
+
+  # ====================================================================
+  # GoQueue Server (Worker Pool, Poller, REST API & Web Dashboard)
+  # ====================================================================
+  goqueue-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: goqueue-server
+    command: ["goqueue-server"]
+    environment:
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=
+      - CONCURRENCY=20
+      - HTTP_PORT=8080
+      - QUEUES=default,critical,emails,payments
+      - GRACE_PERIOD_SEC=20
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 4s
+    restart: unless-stopped
+
+  # ====================================================================
+  # Prometheus Telemetry & Metrics Scraper
+  # ====================================================================
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: goqueue-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - goqueue-server
+    restart: unless-stopped
+
+  # ====================================================================
+  # Synthetic Workload Load Generator (Continuous Traffic Simulation)
+  # ====================================================================
+  goqueue-loadgen:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: goqueue-loadgen
+    entrypoint: ["goqueue-loadgen"]
+    command: ["-count=0", "-rate=60", "-batch=20", "-fail-rate=0.08", "-delay-rate=0.15"]
+    environment:
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      goqueue-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
