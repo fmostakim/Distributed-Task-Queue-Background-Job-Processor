@@ -12,11 +12,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/goqueue/goqueue/internal/broker"
 	"github.com/goqueue/goqueue/internal/task"
 	"github.com/goqueue/goqueue/internal/worker"
 	"github.com/goqueue/goqueue/pkg/api"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 )
 
 func getEnv(key, defaultVal string) string {
@@ -53,18 +55,41 @@ func main() {
 
 	log.Printf("[CONFIG] Redis: %s | Concurrency: %d | Queues: %v | Port: :%s", redisAddr, concurrency, queues, httpPort)
 
-	// 1. Initialize Redis Broker
-	redisCfg := broker.DefaultRedisConfig()
-	redisCfg.Addr = redisAddr
-	redisCfg.Password = redisPassword
-	redisCfg.PoolSize = concurrency * 4
+	// 1. Initialize Redis Broker (with automatic in-memory fallback for local dev)
+	var b *broker.RedisBroker
+	useEmbedded := getEnv("EMBEDDED_REDIS", "false") == "true" || redisAddr == "embedded"
 
-	b, err := broker.NewRedisBroker(redisCfg)
-	if err != nil {
-		log.Fatalf("[FATAL] Failed to initialize Redis broker: %v", err)
+	if !useEmbedded {
+		redisCfg := broker.DefaultRedisConfig()
+		redisCfg.Addr = redisAddr
+		redisCfg.Password = redisPassword
+		redisCfg.PoolSize = concurrency * 4
+
+		var err error
+		b, err = broker.NewRedisBroker(redisCfg)
+		if err != nil {
+			log.Printf("[REDIS NOTICE] External Redis not reachable at %s (%v)", redisAddr, err)
+			log.Println("[REDIS] Auto-starting built-in in-memory Redis engine for seamless local execution...")
+			useEmbedded = true
+		} else {
+			log.Printf("[REDIS] Connected successfully to external Redis at %s", redisAddr)
+		}
+	}
+
+	if useEmbedded {
+		mr, err := miniredis.Run()
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to start embedded Redis: %v", err)
+		}
+		defer mr.Close()
+		log.Printf("[REDIS] Built-in Redis engine active at %s", mr.Addr())
+
+		client := redis.NewClient(&redis.Options{
+			Addr: mr.Addr(),
+		})
+		b = broker.NewRedisBrokerFromClient(client, "goqueue:")
 	}
 	defer b.Close()
-	log.Printf("[REDIS] Connected successfully to Redis at %s", redisAddr)
 
 	// 2. Metrics & Instrumentation
 	promMetrics := api.NewMetrics(prometheus.DefaultRegisterer)
